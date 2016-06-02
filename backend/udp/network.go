@@ -15,9 +15,14 @@
 package udp
 
 import (
+	"bytes"
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
+	"regexp"
+	"runtime"
+	"strconv"
 	"sync"
 	"syscall"
 
@@ -34,6 +39,11 @@ const (
 	encapOverhead = 28 // 20 bytes IP hdr + 8 bytes UDP hdr
 )
 
+const (
+	sock2tun = 0
+	tun2sock = 1
+)
+
 type network struct {
 	backend.SimpleNetwork
 	name   string
@@ -41,12 +51,15 @@ type network struct {
 	ctl    *os.File
 	ctl2   *os.File
 	tun    *os.File
+	tunmq  []*os.File
 	conn   *net.UDPConn
+	multiq bool
+	qnum   int
 	tunNet ip.IP4Net
 	sm     subnet.Manager
 }
 
-func newNetwork(name string, sm subnet.Manager, extIface *backend.ExternalInterface, port int, nw ip.IP4Net, l *subnet.Lease) (*network, error) {
+func newNetwork(name string, sm subnet.Manager, extIface *backend.ExternalInterface, port int, enableMq bool, nw ip.IP4Net, l *subnet.Lease) (*network, error) {
 	n := &network{
 		SimpleNetwork: backend.SimpleNetwork{
 			SubnetLease: l,
@@ -55,6 +68,25 @@ func newNetwork(name string, sm subnet.Manager, extIface *backend.ExternalInterf
 		name: name,
 		port: port,
 		sm:   sm,
+	}
+	surpportMq := false
+	// get kernel version , multi-queue tun-tap driver is only support on 3.8 or latter kernel.
+	vstring, verr := getKernelVersionString()
+
+	if verr == nil {
+
+		v1, v2, v3, verr := extractKernelVersion(vstring)
+		log.Info("kernel version is %d.%d.%d", v1, v2, v3)
+		if verr == nil {
+			surpportMq = isKernelSupportTunTapMultiQueue(v1, v2)
+		}
+
+	}
+	// only config enable multi-queue and the linux kernel version support tun-tap multi-queue driver(at leatest 3.8)
+	if surpportMq && enableMq {
+		n.multiq = true
+	} else {
+		n.multiq = false
 	}
 
 	n.tunNet = nw
@@ -85,15 +117,29 @@ func (n *network) Run(ctx context.Context) {
 		n.ctl2.Close()
 	}()
 
-	// one for each goroutine below
 	wg := sync.WaitGroup{}
 	defer wg.Wait()
 
-	wg.Add(1)
-	go func() {
-		runCProxy(n.tun, n.conn, n.ctl2, n.tunNet.IP, n.MTU())
-		wg.Done()
-	}()
+	if n.multiq {
+		wg.Add(2)
+		log.Info("start routine for multiqueue proxy")
+		go func() {
+			runCProxyMq(n.tunmq, n.conn, n.ctl2, n.tunNet.IP, n.MTU(), tun2sock)
+			wg.Done()
+		}()
+		go func() {
+			runCProxyMq(n.tunmq, n.conn, n.ctl2, n.tunNet.IP, n.MTU(), sock2tun)
+			wg.Done()
+		}()
+
+	} else {
+		wg.Add(1)
+		log.Info("start routine for single queue proxy")
+		go func() {
+			runCProxy(n.tun, n.conn, n.ctl2, n.tunNet.IP, n.MTU())
+			wg.Done()
+		}()
+	}
 
 	log.Info("Watching for new subnet leases")
 
@@ -136,7 +182,18 @@ func (n *network) initTun() error {
 	var tunName string
 	var err error
 
-	n.tun, tunName, err = ip.OpenTun("flannel%d")
+	if n.multiq {
+		n.qnum = 8 // the qnum should be the the little one of 8 and max CPU core number
+		if runtime.NumCPU() < n.qnum {
+			n.qnum = runtime.NumCPU()
+		}
+
+		n.tunmq, tunName, err = ip.OpenTunMq("flannel%d", n.qnum)
+
+	} else {
+		n.tun, tunName, err = ip.OpenTun("flannel%d")
+	}
+
 	if err != nil {
 		return fmt.Errorf("failed to open TUN device: %v", err)
 	}
@@ -201,4 +258,56 @@ func (n *network) processSubnetEvents(batch []subnet.Event) {
 			log.Error("Internal error: unknown event type: ", int(evt.Type))
 		}
 	}
+}
+
+// Runs "uname -r " to get the kernel version string
+func getKernelVersionString() (string, error) {
+	cmd := exec.Command("uname", "-r")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	err := cmd.Run()
+	if err != nil {
+		return "", err
+	}
+	fmt.Println("kernel version string ", out.String())
+	return out.String(), nil
+}
+
+// get the kernel version
+// e.g. "2.6.32-504.16.2.el6.x86_64" would return (2, 6, 32, nil)
+// e.g. "4.2.0-16-generic" would return (4.2.0,nil)
+func extractKernelVersion(str string) (int, int, int, error) {
+	//versionMatcher := regexp.MustCompile("^([0-9]+)\\.([0-9]+)\\.([0-9]+)")
+	versionMatcher := regexp.MustCompile(`^([0-9]+)\.([0-9]+)\.([0-9]+)`)
+	result := versionMatcher.FindStringSubmatch(str)
+	if result == nil {
+		return 0, 0, 0, fmt.Errorf("no iptables version found in string: %s", str)
+	}
+
+	v1, err := strconv.Atoi(result[1])
+	if err != nil {
+		return 0, 0, 0, err
+	}
+
+	v2, err := strconv.Atoi(result[2])
+	if err != nil {
+		return 0, 0, 0, err
+	}
+
+	v3, err := strconv.Atoi(result[3])
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	fmt.Println("v1 v2 v3 is ", v1, v2, v3)
+	return v1, v2, v3, nil
+}
+
+func isKernelSupportTunTapMultiQueue(v1 int, v2 int) bool {
+
+	if v1 > 3 {
+		return true
+	} else if v1 == 3 && v2 >= 8 {
+		return true
+	}
+	return false
 }

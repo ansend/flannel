@@ -48,9 +48,11 @@ func New(sm subnet.Manager, extIface *backend.ExternalInterface) (backend.Backen
 
 func (be *UdpBackend) RegisterNetwork(ctx context.Context, netname string, config *subnet.Config) (backend.Network, error) {
 	cfg := struct {
-		Port int
+		Port     int
+		EnableMq bool
 	}{
-		Port: defaultPort,
+		Port:     defaultPort,
+		EnableMq: false,
 	}
 
 	// Parse our configuration
@@ -83,7 +85,7 @@ func (be *UdpBackend) RegisterNetwork(ctx context.Context, netname string, confi
 		PrefixLen: config.Network.PrefixLen,
 	}
 
-	return newNetwork(netname, be.sm, be.extIface, cfg.Port, tunNet, l)
+	return newNetwork(netname, be.sm, be.extIface, cfg.Port, cfg.EnableMq, tunNet, l)
 }
 
 func (_ *UdpBackend) Run(ctx context.Context) {

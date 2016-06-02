@@ -62,3 +62,50 @@ func OpenTun(name string) (*os.File, string, error) {
 	ifname := fromZeroTerm(ifr.IfrnName[:ifnameSize])
 	return tun, ifname, nil
 }
+
+func OpenTunMq(name string, qnum int) ([]*os.File, string, error) {
+
+	fdlist := make([]*os.File, qnum)
+
+	tunsuccess := true
+	var tun *os.File
+	var err error
+
+	var ifr ifreqFlags
+	copy(ifr.IfrnName[:len(ifr.IfrnName)-1], []byte(name+"\000"))
+	// still no defination of syscall.IFF_MULTI_QUEUE in go,just use 0x0100 here.
+	ifr.IfruFlags = syscall.IFF_TUN | syscall.IFF_NO_PI | 0x0100
+
+	for i := 0; i < qnum; i++ {
+		tun, err = os.OpenFile(tunDevice, os.O_RDWR, 0)
+
+		if err != nil {
+			tunsuccess = false
+			break
+		}
+
+		err = ioctl(int(tun.Fd()), syscall.TUNSETIFF, uintptr(unsafe.Pointer(&ifr)))
+		if err != nil {
+			tunsuccess = false
+			break
+		}
+
+		fdlist[i] = tun
+
+	}
+
+	if !tunsuccess {
+		for i := 0; i < qnum; i++ {
+			if fdlist[i] != nil {
+				(*os.File)(fdlist[i]).Close()
+			}
+			fdlist[i] = nil
+		}
+		return fdlist, "", err
+	}
+
+	ifname := fromZeroTerm(ifr.IfrnName[:ifnameSize])
+
+	return fdlist, ifname, nil
+
+}

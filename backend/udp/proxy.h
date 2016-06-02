@@ -36,5 +36,6 @@ typedef struct command {
 } command;
 
 void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int log_errors);
-
+void run_proxy_mq_sock(const int * tuns, int qnum, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int log_errors);
+void run_proxy_mq_tun(const int * tuns, int qnum, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int log_errors);
 #endif

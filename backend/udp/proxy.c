@@ -31,6 +31,7 @@
 #define CMD_DEFINE
 #include "proxy.h"
 
+
 struct ip_net {
 	in_addr_t ip;
 	in_addr_t mask;
@@ -401,6 +402,12 @@ enum PFD {
 	PFD_CNT
 };
 
+enum PFD_MQ {
+        PFD_MQ_SOCK = 0,
+        PFD_MQ_CTL,
+};
+
+
 void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int log_errors) {
 	char *buf;
 	struct pollfd fds[PFD_CNT] = {
@@ -463,3 +470,111 @@ void run_proxy(int tun, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int
 	free(buf);
 }
 
+void run_proxy_mq_sock(const int * tuns, int qnum, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int log_errors) {
+	char *buf;
+
+	struct pollfd * fds;
+
+
+	fds = (struct pollfd *) malloc(sizeof(struct pollfd) * 2);
+
+	(fds+PFD_MQ_SOCK)->fd = sock;
+	(fds+PFD_MQ_SOCK)->events = POLLIN;
+
+	(fds+PFD_MQ_CTL)->fd = ctl;
+	(fds+PFD_MQ_CTL)->events = POLLIN;
+
+	exit_flag = 0;
+	tun_addr = tun_ip;
+	log_enabled = log_errors;
+
+	buf = (char *) malloc(tun_mtu);
+	if( !buf ) {
+		log_error("Failed to allocate %d byte buffer\n", tun_mtu);
+		exit(1);
+	}
+
+	int count = 0;
+	int fdidx = 0;
+	while( !exit_flag ) {
+		int nfds = poll(fds, 2, -1), activity;
+
+		if( nfds < 0 ) {
+			if( errno == EINTR )
+				continue;
+
+			log_error("Poll failed: %s\n", strerror(errno));
+			exit(1);
+		}
+
+		if( fds[PFD_MQ_CTL].revents & POLLIN )
+			process_cmd(ctl);
+                //round-robin to write packect recved from udp to tun fds.
+		if( fds[PFD_MQ_SOCK].revents & POLLIN ){
+			do {
+				activity = 0;
+				fdidx = count++ % qnum;
+				activity += udp_to_tun(sock, *(tuns + fdidx), buf, tun_mtu);
+			
+                        } while( activity );
+
+		}
+
+	}
+
+	free(buf);
+}
+
+void run_proxy_mq_tun(const int * tuns, int qnum, int sock, int ctl, in_addr_t tun_ip, size_t tun_mtu, int log_errors) {
+	char *buf;
+
+	struct pollfd * fds;
+
+	fds = (struct pollfd *) malloc(sizeof(struct pollfd) * qnum);
+
+	for (int i = 0; i < qnum; i++)
+	{
+		(fds+i)->fd = *(tuns+i);
+		(fds+i)->events = POLLIN;
+	}
+
+	exit_flag = 0;
+	tun_addr = tun_ip;
+	log_enabled = log_errors;
+
+	buf = (char *) malloc(tun_mtu);
+	if( !buf ) {
+		log_error("Failed to allocate %d byte buffer\n", tun_mtu);
+		exit(1);
+	}
+	for (int i = 0; i < qnum; i++)
+	{
+		fcntl(*(tuns+i), F_SETFL, O_NONBLOCK);
+	}
+
+	while( !exit_flag ) {
+
+		int nfds = poll(fds, qnum, -1), activity;
+		if( nfds < 0 ) {
+			if( errno == EINTR )
+				continue;
+			log_error("Poll failed: %s\n", strerror(errno));
+			exit(1);
+		}
+		// loop tun fds for all queues  
+		for(int i = 0;  i < qnum; i++ ){
+			if( fds[i].revents & POLLIN ){
+				
+                                do {
+					activity = 0;
+					activity += tun_to_udp(fds[i].fd, sock, buf, tun_mtu);
+
+				} while( activity );
+			}
+
+		}
+
+	}
+
+	free(buf);
+}
